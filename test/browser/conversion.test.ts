@@ -17,6 +17,7 @@ import { InputVideoTrack } from '../../src/input-track.js';
 import { CanvasSource, EncodedAudioPacketSource } from '../../src/media-source.js';
 import { Quality } from '../../src/encode.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { AudioSampleSink, VideoSampleSink } from '../../src/media-sink.js';
 
 test('Rotation is baked in when rerendering', async () => {
 	using input = new Input({
@@ -783,3 +784,110 @@ test('Resizing at various scale factors', async () => {
 		expect(await videoTrack!.getDisplayHeight()).toBe(height);
 	}
 });
+
+for (const container of ['MP4', 'HLS'] as const) {
+	for (const { label, audioDuration, start } of [
+		{ label: 'after audio ends', audioDuration: 4, start: 5 },
+		{ label: 'overlapping audio', audioDuration: 4, start: 3 },
+		{ label: 'continuous audio', audioDuration: 10, start: 5 },
+	]) {
+		test(`Trim video continuing after audio (${container}, ${label})`, async () => {
+			const fixture = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const canvas = new OffscreenCanvas(64, 64);
+			const ctx = canvas.getContext('2d')!;
+			ctx.fillRect(0, 0, 64, 64);
+			const videoSource = new CanvasSource(canvas, {
+				codec: 'avc',
+				quality: new Quality({ bitrate: 100_000 }),
+				// Avoid the level 1b configuration selected for tiny frames, which Chrome cannot decode.
+				fullCodecString: 'avc1.42001f',
+			});
+			const audioSource = new EncodedAudioPacketSource('aac');
+			fixture.addVideoTrack(videoSource);
+			fixture.addAudioTrack(audioSource);
+			await fixture.start();
+			for (let i = 0; i < 20; i++) {
+				await videoSource.add(i / 2, 1 / 2);
+			}
+			await addAacPackets(audioSource, audioDuration);
+			await fixture.finalize();
+
+			using mp4 = new Input({ source: new BufferSource(fixture.target.buffer!), formats: ALL_FORMATS });
+			const files = new Map<string, ArrayBuffer>();
+			if (container === 'HLS') {
+				const hls = new Output({
+					format: new HlsOutputFormat({ segmentFormat: new MpegTsOutputFormat() }),
+					target: new PathedTarget('master.m3u8', ({ path }) => {
+						const target = new BufferTarget();
+						target.on('finalized', () => files.set(path, target.buffer!));
+						return target;
+					}),
+				});
+				const remux = await Conversion.init({ input: mp4, output: hls });
+				await remux.execute();
+			}
+
+			using input = new Input({
+				formats: ALL_FORMATS,
+				source: container === 'MP4'
+					? new BufferSource(fixture.target.buffer!)
+					: new CustomPathedSource('master.m3u8', ({ path }) => {
+						const buffer = files.get(path);
+						assert(buffer);
+						return new BufferSource(buffer);
+					}),
+			});
+			const inputAudio = await input.getPrimaryAudioTrack();
+			assert(inputAudio);
+			// AAC packets contain 1024 frames, so the generated duration rounds up by at most one packet.
+			const audioEnd = await inputAudio.computeDuration();
+			expect(audioEnd).toBeGreaterThanOrEqual(audioDuration);
+			expect(audioEnd).toBeLessThan(audioDuration + 1024 / 48000 + 1e-6);
+
+			const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+			const conversion = await Conversion.init({
+				input,
+				output,
+				// Exercise decoded-sample trimming; Opus encoding is available on Linux Chrome too.
+				audio: { codec: 'opus', forceTranscode: true },
+				trim: { start, end: 10 },
+			});
+			expect(conversion.isValid).toBe(true);
+			expect(conversion.discardedTracks).toHaveLength(0);
+			await conversion.execute();
+			expect(output.state).toBe('finalized');
+
+			using result = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
+			const video = await result.getPrimaryVideoTrack();
+			assert(video);
+			expect(await video.getFirstTimestamp()).toBeCloseTo(0);
+			expect(await video.computeDuration()).toBeCloseTo(10 - start);
+			let videoFrames = 0;
+			for await (using sample of new VideoSampleSink(video).samples()) {
+				expect(sample.timestamp).toBeCloseTo(videoFrames / 2);
+				videoFrames++;
+			}
+			expect(videoFrames).toBe((10 - start) * 2);
+
+			const audio = await result.getPrimaryAudioTrack();
+			let audioFrames = 0;
+			let firstTimestamp: number | undefined;
+			let lastEnd = 0;
+			if (audio) {
+				for await (using sample of new AudioSampleSink(audio).samples()) {
+					firstTimestamp ??= sample.timestamp;
+					audioFrames += sample.numberOfFrames;
+					lastEnd = sample.timestamp + sample.duration;
+				}
+			}
+			if (start >= audioEnd) {
+				// An omitted track or an empty track is fine, but stale audio must not be moved into the clip.
+				expect(audioFrames).toBe(0);
+			} else {
+				expect(audioFrames).toBeGreaterThan(0);
+				expect(firstTimestamp).toBeCloseTo(0, 1);
+				expect(lastEnd).toBeCloseTo(Math.min(audioEnd, 10) - start, 1);
+			}
+		});
+	}
+}
