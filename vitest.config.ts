@@ -2,6 +2,7 @@
 
 import { defineConfig } from 'vitest/config';
 import path from 'node:path';
+import { hlsCompressionCommands } from './test/hls-compression-server.js';
 
 export default defineConfig({
 	resolve: {
@@ -40,6 +41,7 @@ export default defineConfig({
 					browser: {
 						enabled: true,
 						provider: 'webdriverio',
+						commands: hlsCompressionCommands,
 						instances: [{
 							browser: 'chrome',
 							capabilities: {
